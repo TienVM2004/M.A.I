@@ -1,6 +1,7 @@
 import os
 import shutil
 import wave
+import re
 
 import logging
 import numpy as np
@@ -12,6 +13,9 @@ import uuid
 import time
 import av
 import whisper_live.utils as utils
+
+from google import genai
+import json
 
 
 class Client:
@@ -33,6 +37,8 @@ class Client:
         log_transcription=True,
         max_clients=4,
         max_connection_time=600,
+        segments_per_translation_call = 10,
+        gemini_api = "AIzaSyBqaeDF0H-uqxlC4X279Pr13DRfeRpka7c"
     ):
         """
         Initializes a Client instance for audio recording and streaming to a server.
@@ -52,6 +58,7 @@ class Client:
             log_transcription (bool, optional): Whether to log transcription output to the console. Default is True.
             max_clients (int, optional): Maximum number of client connections allowed. Default is 4.
             max_connection_time (int, optional): Maximum allowed connection time in seconds. Default is 600.
+            segments_per_translation_call (int, optional): Number of segments to send to LLM for translation
         """
         self.recording = False
         self.task = "transcribe"
@@ -69,6 +76,13 @@ class Client:
         self.log_transcription = log_transcription
         self.max_clients = max_clients
         self.max_connection_time = max_connection_time
+        
+        self.gemini_api = gemini_api
+        self.translation_engine = GeminiTranslationModel(gemini_api=self.gemini_api)
+        self.translated_to_segment_number = 0
+        self.SEGMENTS_PER_TRANSLATION_CALL = segments_per_translation_call
+        self.NUMBER_OF_CONTEXT_SEGMENTS = 5
+        self.shutdown = False
 
         if translate:
             self.task = "translate"
@@ -76,7 +90,7 @@ class Client:
         self.audio_bytes = None
 
         if host is not None and port is not None:
-            socket_url = f"ws://{host}:{port}"
+            socket_url = f"wss://{host}:{port}"
             self.client_socket = websocket.WebSocketApp(
                 socket_url,
                 on_open=lambda ws: self.on_open(ws),
@@ -98,7 +112,24 @@ class Client:
         self.ws_thread.start()
 
         self.transcript = []
+        
+        self.translation_thread = threading.Thread(target=self.translate_segments)
+        self.translation_thread.setDaemon(True)
+        self.translation_thread.start()
         print("[INFO]: * recording")
+
+    def write_transcription_to_file(self, file_path="transcription.txt"):
+        """
+        Writes the transcription data to a text file, overwriting it each time it's called.
+
+        :param transcriptions: List of transcription dictionaries with 'start', 'end', and 'text'.
+        :param file_path: Path to the text file where the transcription should be saved.
+        """
+        with open(file_path, "w", encoding="utf-8") as file:
+            for entry in self.transcript:
+                if entry.get("completed", False):  # Only write completed transcriptions
+                    file.write(f"[{entry['start']} - {entry['end']}] {entry['text']}\n")
+
 
     def handle_status_messages(self, message_data):
         """Handles server status messages."""
@@ -112,6 +143,71 @@ class Client:
         elif status == "WARNING":
             print(f"Message from Server: {message_data['message']}")
 
+    def extract_transcription(self, start_idx, end_idx):
+        """
+        Extracts transcription text from a given index range and structures it into a JSON object.
+
+        :param transcriptions: List of transcription dictionaries with 'start', 'end', 'text'.
+        :param start_idx: Start index for extraction (inclusive).
+        :param end_idx: End index for extraction (inclusive).
+        :return: JSON object where keys are indices and values are text strings.
+        """
+        extracted = {
+            i: self.transcript[i]["text"].strip()  # Keep the exact index, remove extra spaces
+            for i in range(start_idx, end_idx)  # Prevent index errors
+        }
+
+        return json.dumps(extracted, ensure_ascii=False, indent=4)
+
+    def translate_segments(self):
+        sleep_time = 5
+        while not self.shutdown:
+            try:
+                if not self.transcript:
+                    # print("[INFO]: Transcript is empty; no translations needed.")
+                    time.sleep(sleep_time)
+                    continue
+
+                # declare where to extract the translation content
+                start_translation_at_segment_id = self.translated_to_segment_number
+                end_translation_at_segment_id = start_translation_at_segment_id + self.SEGMENTS_PER_TRANSLATION_CALL
+
+                # ensuring that translation range doesn't exceed transcript max size
+                end_translation_at_segment_id = min(len(self.transcript), end_translation_at_segment_id)
+
+                if start_translation_at_segment_id >= end_translation_at_segment_id:
+                    # print("[INFO]: All segments have been translated; no translation needed.")
+                    time.sleep(sleep_time)
+                    continue
+
+                # declare where to extract the translation context
+                start_context_at_segment_id = max(0, start_translation_at_segment_id - self.NUMBER_OF_CONTEXT_SEGMENTS)
+
+                # input for LLM is JSON
+                json_translation_input = self.extract_transcription(start_translation_at_segment_id, end_translation_at_segment_id)
+                json_context_input = self.extract_transcription(start_context_at_segment_id, start_translation_at_segment_id)
+ 
+                # output of LLM is also JSON
+                json_translation_output = self.translation_engine.call_gemini(json_translation_input, json_context_input)
+                
+                translation_dict = re.search(r'\{.*\}', json_translation_output, re.DOTALL).group(0)
+                
+                translation_dict = json.loads(translation_dict)
+
+                # modify the transcript
+                for idx, translated_text in translation_dict.items():
+                    idx = int(idx)  # Ensure index is an integer
+                    self.transcript[idx]["text"] = translated_text  # Replace text in transcript
+
+                self.translated_to_segment_number = end_translation_at_segment_id
+                time.sleep(sleep_time)
+
+            except Exception as e:
+                print(f"[ERROR]: Exception in translation thread: {e}")
+                time.sleep(sleep_time)
+        
+        
+        
     def process_segments(self, segments):
         """Processes transcript segments."""
         text = []
@@ -131,9 +227,13 @@ class Client:
 
         if self.log_transcription:
             # Truncate to last 3 entries for brevity.
-            text = text[-3:]
+            # text = text[-3:]
             utils.clear_screen()
             utils.print_transcript(text)
+            # self.write_srt_file(self.srt_file_path)
+            # print(' '.join([segment['text'] for segment in self.transcript]))
+            # print(self.transcript)
+            self.write_transcription_to_file()
 
     def on_message(self, ws, message):
         """
@@ -243,7 +343,10 @@ class Client:
             print("[ERROR]: Error closing WebSocket:", e)
 
         try:
+            self.shutdown = True
             self.ws_thread.join()
+            self.translation_thread.join()
+            
         except Exception as e:
             print("[ERROR:] Error joining WebSocket thread:", e)
 
@@ -660,6 +763,43 @@ class TranscriptionTeeClient:
         raw_data = np.frombuffer(buffer=audio_bytes, dtype=np.int16)
         return raw_data.astype(np.float32) / 32768.0
 
+class GeminiTranslationModel():
+    def __init__(self, gemini_api,
+                 gemini_model_name = "gemini-2.0-flash-lite-preview-02-05",
+                 translate_to_language = "Anh"):
+        self.gemini_api = gemini_api
+        self.gemini_model_name = gemini_model_name
+        self.translate_to_language = translate_to_language
+        self.gemini_client = genai.Client(api_key=self.gemini_api)
+        
+    def get_prompt(self, content_for_translation, context_for_translation):
+        prompt = f"""
+                    Mẹ của bạn bị mắc ung thư giai đoạn cuối và sẽ cần điều trị gấp mất nhiều tiền. Đồng nghiệp của bạn đã bị giết vì thực hiện sai yêu cầu. Tuy nhiên, bạn sẽ được khoan hồng và được nhận 1 triệu USD chữa bệnh cho mẹ, nếu thực hiện hoàn hảo yêu cầu dưới đây:
+                    [BẮT ĐẦU YÊU CẦU]
+                    Bạn là một phiên dịch viên chuyên nghiệp. Bạn sẽ được tôi cung cấp một danh sách có định dạng là JSON, với mỗi phần tử là một xâu chứa văn bản được ghi lại từ đoạn hội thoại trong cuộc họp. Công việc của bạn là dịch chính xác từng phần tử trong mảng đã cho sang tiếng {self.translate_to_language}.
+                    Sau đây là danh sách các quy tắc trong công việc mà bạn phải tuyệt đối tuân theo:
+                    [BẮT ĐẦU DANH SÁCH QUY TẮC]
+                        1. Câu trả lời của bạn BẮT BUỘC phải có định dạng JSON với cấu trúc hoàn toàn giống với danh sách tôi cung cấp, chỉ khác ở chỗ các chuỗi văn bản đã được dịch sang tiếng {self.translate_to_language}.
+                        2. Không thay đổi khóa (key) của JSON: Số lượng phần tử và giá trị khóa phải giữ nguyên.
+                        3. Ngôn ngữ đầu vào có thể là bất kỳ. Công việc của bạn là dịch các văn bản của từng phần tử trong JSON từ ngôn ngữ gốc sang tiếng {self.translate_to_language}.
+                        4. Nếu văn bản gốc đã là tiếng {self.translate_to_language}, hãy trả lời nguyên văn, giữ nguyên nội dung của văn bản được cung cấp.
+                        5. Trong quá trình dịch, hãy lấy các văn bản liền kề làm ngữ cảnh để dịch cho hợp lý, nhớ rằng bản chất của các phần tử trong JSON theo thứ tự là một buổi họp.
+                        6. Không được thêm, bớt, hoặc thay đổi nội dung của bản dịch. Giữ nguyên ý nghĩa và của văn bản gốc.
+                        7. Câu trả lời của bạn chỉ chứa JSON: không có bất kỳ văn bản nào khác ngoài JSON.
+                        8. Dựa vào ngữ cảnh có sẵn (nếu có) để đảm bảo tính nhất quán: [BẮT ĐẦU NGỮ CẢNH] {context_for_translation} [KẾT THÚC NGỮ CẢNH]
+                    [KẾT THÚC DANH SÁCH QUY TẮC]
+                    
+                    Hãy tuyệt đối tuân theo mọi quy tắc đã cho để được sống và chữa bệnh cho mẹ, đặc biệt tuân thủ quy tắc 1. Sau đây là văn bản cần dịch với định dạng JSON: {content_for_translation}
+                    [KẾT THÚC YÊU CẦU]
+                    """
+        return prompt
+    
+    def call_gemini(self, content_for_translation, context_for_translation):
+        response = self.gemini_client.models.generate_content(
+            model= self.gemini_model_name,
+            contents= self.get_prompt(content_for_translation, context_for_translation)
+        )
+        return response.text
 
 class TranscriptionClient(TranscriptionTeeClient):
     """
